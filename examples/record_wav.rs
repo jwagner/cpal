@@ -8,6 +8,7 @@ use cpal::{FromSample, Sample};
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "CPAL record_wav example", long_about = None)]
@@ -68,6 +69,20 @@ fn main() -> Result<(), anyhow::Error> {
     ))]
     let host = cpal::default_host();
 
+    let host = cpal::host_from_id(cpal::HostId::PulseAudio).unwrap();
+    let mut devices: Vec<_> = host.input_devices()?.collect();
+    devices.extend(
+        cpal::host_from_id(cpal::HostId::Alsa)
+            .unwrap()
+            .input_devices()?,
+    );
+    for d in &devices {
+        dbg!(d.name(), d.default_input_config(),);
+        for cfg in d.supported_input_configs().unwrap() {
+            dbg!(cfg);
+        }
+    }
+
     // Set up the input device and stream with the default input config.
     let device = if opt.device == "default" {
         host.default_input_device()
@@ -84,10 +99,23 @@ fn main() -> Result<(), anyhow::Error> {
         .expect("Failed to get default input config");
     println!("Default input config: {config:?}");
 
+    // let stream_config = config.config();
+    let config_range = device
+        .supported_input_configs()
+        .expect("failed to get supported input configs")
+        .find(|c| c.sample_format() == cpal::SampleFormat::F32)
+        .expect("failed to find f32 config");
+    dbg!(&config_range);
+
+    let supported_config = config_range.with_sample_rate(cpal::SampleRate(48_000.clamp(
+        config_range.min_sample_rate().0,
+        config_range.max_sample_rate().0,
+    )));
     // The WAV file we're recording to.
-    const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recorded.wav");
-    let spec = wav_spec_from_config(&config);
-    let writer = hound::WavWriter::create(PATH, spec)?;
+    // const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recorded.wav");
+    const PATH: &str = "/tmp/foo.wav";
+    let spec = wav_spec_from_config(&supported_config);
+    let writer = hound::WavWriter::create(PATH, spec).expect("writer");
     let writer = Arc::new(Mutex::new(Some(writer)));
 
     // A flag to indicate that recording is in progress.
@@ -99,8 +127,15 @@ fn main() -> Result<(), anyhow::Error> {
     let err_fn = move |err| {
         eprintln!("an error occurred on stream: {err}");
     };
+    let mut config = supported_config.config();
+    if let cpal::SupportedBufferSize::Range { min, max } = supported_config.buffer_size() {
+        config.buffer_size = cpal::BufferSize::Fixed(512.clamp(*min, *max));
+    }
+    config.channels = 2;
+    // config.buffer_size = cpal::BufferSize::Fixed(512);
+    dbg!(&supported_config, &config);
 
-    let stream = match config.sample_format() {
+    let stream = match supported_config.sample_format() {
         cpal::SampleFormat::I8 => device.build_input_stream(
             &config.into(),
             move |data, _: &_| write_input_data::<i8, i8>(data, &writer_2),
@@ -123,7 +158,7 @@ fn main() -> Result<(), anyhow::Error> {
             &config.into(),
             move |data, _: &_| write_input_data::<f32, f32>(data, &writer_2),
             err_fn,
-            None,
+            Some(Duration::from_secs(1)),
         )?,
         sample_format => {
             return Err(anyhow::Error::msg(format!(
